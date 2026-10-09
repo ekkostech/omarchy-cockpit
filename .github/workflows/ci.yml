@@ -16,4 +16,4 @@ jobs:
             for (const f of Object.values(m.entryPoints)) require("fs").accessSync(f);
             if (m.version !== require("child_process").execSync("grep -m1 -oE \"^## \\\\[?[0-9.]+\" CHANGELOG.md").toString().replace(/^## \[?/, "").trim()) throw new Error("CHANGELOG top entry must match manifest version " + m.version);
           '
-      - run: bash -n bin/cockpit-scan
+      - run: python3 -m py_compile bin/cockpit-scan

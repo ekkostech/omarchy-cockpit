@@ -125,7 +125,7 @@ Item {
   // ---- processes --------------------------------------------------------
   Process {
     id: scanProc
-    command: ["bash", root.pluginDir + "/bin/cockpit-scan"]
+    command: ["python3", "-I", root.pluginDir + "/bin/cockpit-scan"]
     stdout: StdioCollector { onStreamFinished: root.onScan(text) }
   }
 

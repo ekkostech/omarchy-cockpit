@@ -53,7 +53,7 @@ Mouse works too: click a repo or a worktree to select it.
 
 ## Requirements
 
-Omarchy 4 (Quickshell shell), `git`, `jq`, `python3`. ekkOS Personal is optional.
+Omarchy 4 (Quickshell shell), `git`, `python3`. ekkOS Personal is optional.
 
 ## Development
 

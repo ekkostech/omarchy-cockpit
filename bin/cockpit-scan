@@ -1,68 +1,101 @@
-#!/usr/bin/env bash
-# cockpit-scan: everything Cockpit shows, as one JSON document.
+#!/usr/bin/env python3
+# cockpit-scan: everything Cockpit shows, as one JSON document on stdout.
 #   repos:     every git repo under the scan roots (and any folder a terminal is in),
 #              with its worktrees, branches and status
 #   terminals: terminal windows (Hyprland) with the folder their shell is in
 # Usage: cockpit-scan [--root DIR]... [--max-depth N]
-set -u
-roots=(); depth=3
-while (($#)); do case $1 in --root) roots+=("$2"); shift 2 ;; --max-depth) depth=$2; shift 2 ;; *) shift ;; esac; done
-((${#roots[@]})) || roots=("$HOME/Projects" "$HOME/code" "$HOME/src" "$HOME/dev" "$HOME/Work")
+#
+# Window titles and other private data only ever travel through pipes and
+# /proc, never through command-line arguments, which other local users can read.
+import json, os, subprocess, sys, time
 
-# --- terminals: window -> pty -> shell pid -> cwd ---------------------------
-clients=$(hyprctl -j clients 2>/dev/null || echo '[]')
-ps_out=$(ps -e -o pid=,ppid=,tty=)
-terminals=$(jq -c -n --argjson c "$clients" --arg ps "$ps_out" '
-  ($ps | split("\n") | map(select(length>0) | gsub("^ +";"") | split(" +";"") ) | map({pid:.[0], ppid:.[1], tty:.[2]})) as $procs
-  | [ $c[] | select(.mapped != false and .pid > 0) | . as $w
-      | ($procs | map(select(.ppid == ($w.pid|tostring) and (.tty|startswith("pts/")))) ) as $kids
-      | select(($kids|length) == 1)
-      | {address: .address, pid: (.pid|tostring), shellPid: $kids[0].pid, pty: $kids[0].tty,
-         title: .title, class: .class, workspace: (.workspace.name // (.workspace.id|tostring)), focused: (.focusHistoryID == 0)} ]')
-# cwd of each shell, read from /proc (no forks per process)
-terminals=$(jq -c '.' <<<"$terminals" | python3 -c '
-import json, os, sys
-ts = json.load(sys.stdin)
-for t in ts:
-    try: t["cwd"] = os.readlink("/proc/" + t["shellPid"] + "/cwd")
-    except OSError: t["cwd"] = ""
-    title = t["title"]
-    t["agent"] = "working" if title[:1] in "◐◑◒◓" else "idle" if title[:1] == "✳" else "other"
-print(json.dumps(ts))')
+def run(args, timeout=20):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
-# --- repos ---------------------------------------------------------------------
-declare -A seen; repos=()
-# Keyed by the main worktree, so a linked worktree never lists its repo twice.
-add_repo() { local top common main; top=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) || return
-  common=$(git -C "$top" rev-parse --git-common-dir 2>/dev/null) || return; [[ $common != /* ]] && common="$top/$common"
-  main=$(git -C "${common%/.git}" rev-parse --show-toplevel 2>/dev/null) || main=$top
-  [[ -n ${seen[$main]:-} ]] && return; seen[$main]=1; repos+=("$main"); }
-for r in "${roots[@]}"; do [ -d "$r" ] || continue
-  while IFS= read -r g; do add_repo "${g%/.git}"; done < <(find "$r" -maxdepth "$depth" -name .git \( -type d -o -type f \) -not -path "*/.ekkos-worktrees/*" -not -path "*/node_modules/*" 2>/dev/null)
-done
-while IFS= read -r d; do [ -n "$d" ] && add_repo "$d"; done < <(jq -r '.[].cwd' <<<"$terminals")
+def main():
+    roots, depth = [], 3
+    argv = sys.argv[1:]
+    while argv:
+        a = argv.pop(0)
+        if a == "--root" and argv: roots.append(argv.pop(0))
+        elif a == "--max-depth" and argv: depth = int(argv.pop(0))
+    home = os.path.expanduser("~")
+    roots = roots or [os.path.join(home, d) for d in ("Projects", "code", "src", "dev", "Work")]
 
-repo_json() { # one repo with all its worktrees
-  local top=$1 common; common=$(git -C "$top" rev-parse --git-common-dir 2>/dev/null); [[ $common != /* ]] && common="$top/$common"; common=${common%/.git}; common=${common%/}
-  local main_top; main_top=$(git -C "$common" rev-parse --show-toplevel 2>/dev/null || echo "$top")
-  local remote; remote=$(git -C "$main_top" remote get-url origin 2>/dev/null || true)
-  local wts="[]"
-  while IFS= read -r line; do
-    case $line in "worktree "*) wt=${line#worktree }; wt_branch=""; wt_head="";; "HEAD "*) wt_head=${line#HEAD };; "branch "*) wt_branch=${line#branch refs/heads/};; "")
-      [ -n "${wt:-}" ] || continue
-      local dirty ahead behind age upstream
-      dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l)
-      upstream=$(git -C "$wt" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
-      if [ -n "$upstream" ]; then read -r behind ahead < <(git -C "$wt" rev-list --left-right --count "$upstream...HEAD" 2>/dev/null || echo "0 0"); else ahead=""; behind=""; fi
-      age=$(git -C "$wt" log -1 --format=%ct 2>/dev/null || echo 0)
-      wts=$(jq -c --arg p "$wt" --arg b "$wt_branch" --arg h "${wt_head:0:7}" --argjson d "$dirty" --arg a "$ahead" --arg bh "$behind" --arg u "$upstream" --argjson t "$age" --argjson main "$([ "$wt" = "$main_top" ] && echo true || echo false)" \
-        '. + [{path:$p, branch:$b, head:$h, dirty:$d, ahead:($a|if .=="" then null else tonumber end), behind:($bh|if .=="" then null else tonumber end), upstream:$u, lastCommit:$t, main:$main}]' <<<"$wts")
-      wt="";;
-    esac
-  done < <(git -C "$main_top" worktree list --porcelain 2>/dev/null; echo)
-  jq -c -n --arg path "$main_top" --arg name "$(basename "$main_top")" --arg remote "$remote" --argjson wts "$wts" '{path:$path, name:$name, remote:$remote, worktrees:$wts}'
-}
-repos_json="[]"
-for top in "${repos[@]}"; do repos_json=$(jq -c --argjson r "$(repo_json "$top")" '. + [$r]' <<<"$repos_json"); done
+    # --- terminals: window -> pty -> shell pid -> cwd ---------------------------
+    try: clients = json.loads(run(["hyprctl", "-j", "clients"]) or "[]")
+    except json.JSONDecodeError: clients = []
+    kids = {}
+    for line in run(["ps", "-e", "-o", "pid=,ppid=,tty="]).splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[2].startswith("pts/"):
+            kids.setdefault(parts[1], []).append((parts[0], parts[2]))
+    terminals = []
+    for w in clients:
+        if not isinstance(w, dict) or w.get("mapped") is False or not isinstance(w.get("pid"), int) or w["pid"] <= 0: continue
+        shells = kids.get(str(w["pid"]), [])
+        if len(shells) != 1: continue
+        shell_pid, pty = shells[0]
+        try: cwd = os.readlink(f"/proc/{shell_pid}/cwd")
+        except OSError: cwd = ""
+        title = str(w.get("title", ""))
+        ws = w.get("workspace") or {}
+        terminals.append({
+            "address": w.get("address", ""), "pid": str(w["pid"]), "shellPid": shell_pid, "pty": pty,
+            "title": title, "class": w.get("class", ""), "workspace": ws.get("name") or str(ws.get("id", "")),
+            "focused": w.get("focusHistoryID") == 0, "cwd": cwd,
+            "agent": "working" if title[:1] in "◐◑◒◓" else "idle" if title[:1] == "✳" else "other",
+        })
 
-jq -c -n --argjson repos "$repos_json" --argjson terminals "$terminals" --arg now "$(date +%s)" '{now:($now|tonumber), repos:$repos, terminals:$terminals}'
+    # --- repos ---------------------------------------------------------------------
+    def git(path, *args):
+        return run(["git", "-C", path, *args]).strip()
+    def main_worktree(path):
+        top = git(path, "rev-parse", "--show-toplevel")
+        if not top: return None
+        common = git(top, "rev-parse", "--path-format=absolute", "--git-common-dir") or ""
+        if common.endswith("/.git"): common = common[:-5]
+        return git(common, "rev-parse", "--show-toplevel") or top if common else top
+    seen, repos = set(), []
+    def add(path):
+        main = main_worktree(path)
+        if main and main not in seen: seen.add(main); repos.append(main)
+    for root in roots:
+        if not os.path.isdir(root): continue
+        base = root.rstrip("/").count("/")
+        for dirpath, dirnames, filenames in os.walk(root):
+            if dirpath.count("/") - base >= depth: dirnames[:] = []
+            dirnames[:] = [d for d in dirnames if d not in (".ekkos-worktrees", "node_modules", ".git")]
+            if os.path.exists(os.path.join(dirpath, ".git")): add(dirpath); dirnames[:] = []
+    for t in terminals:
+        if t["cwd"]: add(t["cwd"])
+
+    def worktrees(main):
+        out, wt = [], None
+        for line in (run(["git", "-C", main, "worktree", "list", "--porcelain"]) + "\n").splitlines():
+            if line.startswith("worktree "): wt = {"path": line[9:], "branch": "", "head": ""}
+            elif line.startswith("HEAD ") and wt: wt["head"] = line[5:12]
+            elif line.startswith("branch ") and wt: wt["branch"] = line[7:].replace("refs/heads/", "", 1)
+            elif line == "" and wt:
+                p = wt["path"]
+                dirty = len([l for l in run(["git", "-C", p, "status", "--porcelain"]).splitlines() if l])
+                upstream = git(p, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+                ahead = behind = None
+                if upstream:
+                    counts = git(p, "rev-list", "--left-right", "--count", f"{upstream}...HEAD").split()
+                    if len(counts) == 2: behind, ahead = int(counts[0]), int(counts[1])
+                age = git(p, "log", "-1", "--format=%ct")
+                wt.update({"dirty": dirty, "ahead": ahead, "behind": behind, "upstream": upstream,
+                           "lastCommit": int(age) if age.isdigit() else 0, "main": p == main})
+                out.append(wt); wt = None
+        return out
+    repo_list = [{"path": m, "name": os.path.basename(m), "remote": git(m, "remote", "get-url", "origin"), "worktrees": worktrees(m)} for m in repos]
+
+    json.dump({"now": int(time.time()), "repos": repo_list, "terminals": terminals}, sys.stdout, separators=(",", ":"))
+    print()
+
+if __name__ == "__main__":
+    main()
