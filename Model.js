@@ -52,6 +52,9 @@ function buildWorktree(wt, repo, terminals, claims, now) {
   var warnings = [];
   if (claim && claim.state === "active" && claim.stale) warnings.push("stale claim");
   if (wt.ahead > 0) warnings.push(wt.ahead + " unpushed");
+  if (wt.statusKnown === false) warnings.push("Git status unavailable");
+  if (wt.locked) warnings.push("locked worktree");
+  if (!wt.upstream && wt.published === false) warnings.push("no known remote copy");
   if (wt.dirty > 0 && terms.length === 0 && !wt.main) warnings.push("dirty, nobody in it");
   return Object.assign({}, wt, {
     name: wt.main ? basename(wt.path) : basename(wt.path),
@@ -65,7 +68,7 @@ function buildWorktree(wt, repo, terminals, claims, now) {
 function buildRepo(repo, terminals, claims, now) {
   var wts = repo.worktrees.map(function (w) { return buildWorktree(w, repo, terminals, claims, now); });
   // Same branch checked out in two places, or two terminals on one branch.
-  var byBranch = {};
+  var byBranch = Object.create(null);
   wts.forEach(function (w) { if (w.branch) { (byBranch[w.branch] = byBranch[w.branch] || []).push(w); } });
   var warnings = [];
   Object.keys(byBranch).forEach(function (b) {
@@ -100,16 +103,54 @@ function build(scanText, claimsText, thisDevice) {
   var placed = {};
   repos.forEach(function (r) { r.worktrees.forEach(function (w) { w.terminals.forEach(function (t) { placed[t.address] = true; }); }); });
   return {
-    repos: repos, terminals: terminals, claims: claims,
+    now: now, repos: repos, terminals: terminals, claims: claims,
     unplaced: terminals.filter(function (t) { return !placed[t.address]; })
   };
 }
 
 function matches(repo, filter) {
-  var f = String(filter || "").toLowerCase();
-  if (!f) return true;
-  if (repo.name.toLowerCase().indexOf(f) >= 0) return true;
-  return repo.worktrees.some(function (w) {
-    return (w.branch || "").toLowerCase().indexOf(f) >= 0 || w.terminals.some(function (t) { return (t.title || "").toLowerCase().indexOf(f) >= 0; });
+  var words = String(filter || "").toLowerCase().trim().split(/\s+/).filter(Boolean);
+  var haystack = [repo.name, repo.path].concat(repo.worktrees.map(function(w) {
+    return [w.branch, w.path, w.claim ? w.claim.task : ""].concat(w.terminals.map(function(t) { return t.title + " " + t.workspace; })).join(" ");
+  })).join(" ").toLowerCase();
+  return words.every(function(w) { return haystack.indexOf(w) >= 0; });
+}
+function attention(repo) {
+  return !!repo.error || repo.waiting || repo.dirty > 0 || repo.warnings.length > 0 || repo.worktrees.some(function(w) { return w.warnings.length > 0 || w.behind > 0; });
+}
+function visible(repos, query, mode, pins, sort) {
+  var out = repos.filter(function(r) {
+    if (!matches(r, query)) return false;
+    if (mode === "attention") return attention(r);
+    if (mode === "active") return r.terminals > 0 || r.worktrees.some(function(w) { return w.claim && w.claim.state === "active"; }) || r.remoteClaims.length > 0;
+    if (mode === "pinned") return pins.indexOf(r.path) >= 0;
+    return true;
   });
+  return out.slice().sort(function(a,b) {
+    var pin = (pins.indexOf(b.path) >= 0) - (pins.indexOf(a.path) >= 0);
+    if(pin) return pin;
+    if(sort === "name") return a.name.localeCompare(b.name);
+    return (b.waiting-a.waiting) || (attention(b)-attention(a)) || (b.working-a.working) || (b.terminals-a.terminals) || a.name.localeCompare(b.name);
+  });
+}
+function selectedIndex(list, path) {
+  for(var i=0;i<list.length;i++) if(list[i].path===path) return i;
+  return list.length ? 0 : -1;
+}
+function summary(repos) {
+  var result={repos:repos.length,worktrees:0,terminals:0,working:0,waiting:0,attention:0};
+  repos.forEach(function(r){ result.worktrees+=r.worktrees.length;result.terminals+=r.terminals;result.attention+=attention(r)?1:0;
+    r.worktrees.forEach(function(w){w.terminals.forEach(function(t){result.working+=t.agent==="working"?1:0;result.waiting+=t.agent==="idle"?1:0;});});});
+  return result;
+}
+function cleanupReason(w) {
+  if(!w) return "Choose a worktree.";
+  if(w.main) return "Main checkout";
+  if(w.locked) return "Locked worktree";
+  if(w.statusKnown===false) return "Git status unavailable";
+  if(w.dirty>0) return "Uncommitted changes";
+  if(w.terminals.length) return "Terminal still using it";
+  if(w.claim && w.claim.state==="active") return "Active agent claim";
+  if(w.ahead>0 || w.published===false) return "No known remote copy";
+  return "";
 }

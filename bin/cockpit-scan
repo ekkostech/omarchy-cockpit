@@ -1,101 +1,291 @@
 #!/usr/bin/env python3
-# cockpit-scan: everything Cockpit shows, as one JSON document on stdout.
-#   repos:     every git repo under the scan roots (and any folder a terminal is in),
-#              with its worktrees, branches and status
-#   terminals: terminal windows (Hyprland) with the folder their shell is in
-# Usage: cockpit-scan [--root DIR]... [--max-depth N]
-#
-# Window titles and other private data only ever travel through pipes and
-# /proc, never through command-line arguments, which other local users can read.
-import json, os, subprocess, sys, time
+"""Cockpit data/actions. Private payloads travel through pipes, never shell strings."""
+import argparse
+import concurrent.futures
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 
-def run(args, timeout=20):
+
+def command(args, timeout=6):
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
+        p = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout,
+                           env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C.UTF-8"})
+        return p.returncode, p.stdout, p.stderr.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, "", str(e)
 
-def main():
-    roots, depth = [], 3
-    argv = sys.argv[1:]
-    while argv:
-        a = argv.pop(0)
-        if a == "--root" and argv: roots.append(argv.pop(0))
-        elif a == "--max-depth" and argv: depth = int(argv.pop(0))
-    home = os.path.expanduser("~")
-    roots = roots or [os.path.join(home, d) for d in ("Projects", "code", "src", "dev", "Work")]
 
-    # --- terminals: window -> pty -> shell pid -> cwd ---------------------------
-    try: clients = json.loads(run(["hyprctl", "-j", "clients"]) or "[]")
-    except json.JSONDecodeError: clients = []
+def git(path, *args):
+    return command(["git", "-C", str(path), *args])
+
+
+def read_json(path, fallback):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return fallback
+
+
+def config_path():
+    return Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "omarchy/cockpit.json"
+
+
+def settings():
+    value = read_json(config_path(), {})
+    if not isinstance(value, dict): value = {}
+    roots = value.get("roots", [])
+    pins = value.get("pins", [])
+    return {"roots": [s for s in roots if isinstance(s, str) and s.startswith("/")][:30] if isinstance(roots, list) else [],
+            "pins": [s for s in pins if isinstance(s, str) and s.startswith("/")][:200] if isinstance(pins, list) else []}
+
+
+def save_settings(value):
+    target = config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".cockpit-", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w") as f: json.dump(value, f)
+        os.replace(name, target)
+    finally:
+        if os.path.exists(name): os.unlink(name)
+
+
+def claims():
+    tool = shutil.which("ekkos-personal")
+    device = read_json(Path.home() / ".config/ekkos-personal/client.json", {}).get("device_id", "")
+    if not tool: return {"claims": [], "device": device, "status": "not installed"}
+    code, out, err = command([tool, "work", "status"], timeout=10)
+    try:
+        value = json.loads(out)
+        if code or not isinstance(value.get("claims"), list): raise ValueError()
+        return {"claims": value["claims"], "device": device, "status": "connected"}
+    except (ValueError, AttributeError):
+        return {"claims": [], "device": device, "status": "unavailable"}
+
+
+def terminals():
+    code, out, err = command(["hyprctl", "-j", "clients"])
+    try: clients = json.loads(out)
+    except ValueError: clients = []
     kids = {}
-    for line in run(["ps", "-e", "-o", "pid=,ppid=,tty="]).splitlines():
+    for line in command(["ps", "-e", "-o", "pid=,ppid=,tty="])[1].splitlines():
         parts = line.split()
         if len(parts) >= 3 and parts[2].startswith("pts/"):
             kids.setdefault(parts[1], []).append((parts[0], parts[2]))
-    terminals = []
+    result = []
     for w in clients:
-        if not isinstance(w, dict) or w.get("mapped") is False or not isinstance(w.get("pid"), int) or w["pid"] <= 0: continue
-        shells = kids.get(str(w["pid"]), [])
-        if len(shells) != 1: continue
-        shell_pid, pty = shells[0]
-        try: cwd = os.readlink(f"/proc/{shell_pid}/cwd")
+        if not isinstance(w, dict) or w.get("mapped") is False: continue
+        children = kids.get(str(w.get("pid")), [])
+        if len(children) != 1: continue
+        pid, pty = children[0]
+        try: cwd = os.readlink(f"/proc/{pid}/cwd")
         except OSError: cwd = ""
         title = str(w.get("title", ""))
+        working = bool(re.match(r"^[◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]", title))
         ws = w.get("workspace") or {}
-        terminals.append({
-            "address": w.get("address", ""), "pid": str(w["pid"]), "shellPid": shell_pid, "pty": pty,
-            "title": title, "class": w.get("class", ""), "workspace": ws.get("name") or str(ws.get("id", "")),
-            "focused": w.get("focusHistoryID") == 0, "cwd": cwd,
-            "agent": "working" if title[:1] in "◐◑◒◓" else "idle" if title[:1] == "✳" else "other",
-        })
+        result.append({"address": w.get("address", ""), "pid": str(w.get("pid", "")), "pty": pty,
+                       "title": title, "class": w.get("class", ""), "cwd": cwd,
+                       "workspace": ws.get("name") or str(ws.get("id", "")), "focused": w.get("focusHistoryID") == 0,
+                       "agent": "working" if working else "idle" if title.startswith("✳") else "other"})
+    return result, "connected" if code == 0 else "unavailable"
 
-    # --- repos ---------------------------------------------------------------------
-    def git(path, *args):
-        return run(["git", "-C", path, *args]).strip()
-    def main_worktree(path):
-        top = git(path, "rev-parse", "--show-toplevel")
-        if not top: return None
-        common = git(top, "rev-parse", "--path-format=absolute", "--git-common-dir") or ""
-        if common.endswith("/.git"): common = common[:-5]
-        return git(common, "rev-parse", "--show-toplevel") or top if common else top
-    seen, repos = set(), []
-    def add(path):
-        main = main_worktree(path)
-        if main and main not in seen: seen.add(main); repos.append(main)
+
+def canonical(path):
+    code, top, _ = git(path, "rev-parse", "--show-toplevel")
+    if code: return None
+    top = top.strip()
+    code, common, _ = git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    common = common.strip()
+    return os.path.realpath(common[:-5]) if not code and common.endswith("/.git") else top
+
+
+def discover(roots, terms, depth):
+    seen = set()
+    def add(p):
+        value = canonical(p)
+        if value: seen.add(value)
     for root in roots:
+        root = os.path.realpath(os.path.expanduser(root))
         if not os.path.isdir(root): continue
-        base = root.rstrip("/").count("/")
-        for dirpath, dirnames, filenames in os.walk(root):
-            if dirpath.count("/") - base >= depth: dirnames[:] = []
-            dirnames[:] = [d for d in dirnames if d not in (".ekkos-worktrees", "node_modules", ".git")]
-            if os.path.exists(os.path.join(dirpath, ".git")): add(dirpath); dirnames[:] = []
-    for t in terminals:
+        base = root.count(os.sep)
+        for path, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in (".ekkos-worktrees", "node_modules", ".git", ".cache", "vendor", ".venv")]
+            if path.count(os.sep) - base >= depth: dirs[:] = []
+            if os.path.exists(os.path.join(path, ".git")):
+                add(path)
+                dirs[:] = []
+    for t in terms:
         if t["cwd"]: add(t["cwd"])
+    return sorted(seen)
 
-    def worktrees(main):
-        out, wt = [], None
-        for line in (run(["git", "-C", main, "worktree", "list", "--porcelain"]) + "\n").splitlines():
-            if line.startswith("worktree "): wt = {"path": line[9:], "branch": "", "head": ""}
-            elif line.startswith("HEAD ") and wt: wt["head"] = line[5:12]
-            elif line.startswith("branch ") and wt: wt["branch"] = line[7:].replace("refs/heads/", "", 1)
-            elif line == "" and wt:
-                p = wt["path"]
-                dirty = len([l for l in run(["git", "-C", p, "status", "--porcelain"]).splitlines() if l])
-                upstream = git(p, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
-                ahead = behind = None
-                if upstream:
-                    counts = git(p, "rev-list", "--left-right", "--count", f"{upstream}...HEAD").split()
-                    if len(counts) == 2: behind, ahead = int(counts[0]), int(counts[1])
-                age = git(p, "log", "-1", "--format=%ct")
-                wt.update({"dirty": dirty, "ahead": ahead, "behind": behind, "upstream": upstream,
-                           "lastCommit": int(age) if age.isdigit() else 0, "main": p == main})
-                out.append(wt); wt = None
-        return out
-    repo_list = [{"path": m, "name": os.path.basename(m), "remote": git(m, "remote", "get-url", "origin"), "worktrees": worktrees(m)} for m in repos]
 
-    json.dump({"now": int(time.time()), "repos": repo_list, "terminals": terminals}, sys.stdout, separators=(",", ":"))
-    print()
+def worktree_records(path):
+    code, out, err = git(path, "worktree", "list", "--porcelain", "-z")
+    if code: raise RuntimeError(err or "Cannot list worktrees")
+    result, current = [], {}
+    for field in out.split("\0"):
+        if field.startswith("worktree "):
+            if current: result.append(current)
+            current = {"path": field[9:], "branch": "", "head": "", "locked": False, "prunable": False}
+        elif field.startswith("HEAD "): current["head"] = field[5:]
+        elif field.startswith("branch "): current["branch"] = field[7:].removeprefix("refs/heads/")
+        elif field.startswith("locked"): current["locked"] = True
+        elif field.startswith("prunable"): current["prunable"] = True
+    if current: result.append(current)
+    return result
 
-if __name__ == "__main__":
-    main()
+
+def status_files(path):
+    code, out, err = git(path, "status", "--porcelain=v1", "-z")
+    files, entries, i = [], out.split("\0"), 0
+    while i < len(entries):
+        item = entries[i]; i += 1
+        if not item: continue
+        state, name = item[:2], item[3:]
+        old = ""
+        if "R" in state or "C" in state:
+            if i < len(entries): old = entries[i]; i += 1
+        files.append({"status": state, "path": name, "from": old})
+    return files, code == 0, err
+
+
+def inspect_worktree(wt, main):
+    p = wt["path"]
+    files, known, err = status_files(p)
+    upstream = git(p, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")[1].strip()
+    ahead = behind = None
+    if upstream:
+        code, counts, _ = git(p, "rev-list", "--left-right", "--count", f"{upstream}...HEAD")
+        if not code and len(counts.split()) == 2: behind, ahead = map(int, counts.split())
+    age = git(p, "log", "-1", "--format=%ct")[1].strip()
+    # Remote refs are a local observation, never a claim that a network fetch just happened.
+    code, refs, _ = git(p, "for-each-ref", "--contains=HEAD", "--format=%(refname)", "refs/remotes/")
+    return {**wt, "main": os.path.realpath(p) == os.path.realpath(main), "dirty": len(files) if known else None,
+            "statusKnown": known, "error": "" if known else (err or "Worktree unavailable"),
+            "ahead": ahead, "behind": behind, "upstream": upstream, "published": not code and bool(refs.strip()),
+            "lastCommit": int(age) if age.isdigit() else 0}
+
+
+def inspect_repo(main):
+    try:
+        records = worktree_records(main)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            worktrees = list(pool.map(lambda w: inspect_worktree(w, main), records))
+        return {"path": main, "name": os.path.basename(main), "remote": git(main, "remote", "get-url", "origin")[1].strip(), "worktrees": worktrees}
+    except RuntimeError as e:
+        return {"path": main, "name": os.path.basename(main), "remote": "", "worktrees": [], "error": str(e)}
+
+
+def scan(roots=None, depth=3):
+    started = time.monotonic()
+    cfg = settings()
+    roots = roots or cfg["roots"] or [str(Path.home() / d) for d in ("Projects", "code", "src", "dev", "Work")]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        cf = pool.submit(claims)
+        terms, terminal_status = terminals()
+        paths = discover(roots, terms, depth)
+        repos = list(pool.map(inspect_repo, paths))
+        info = cf.result()
+    agent_file = Path.home() / ".config/omarchy/defaults/agent"
+    try: agent = agent_file.read_text().strip()
+    except OSError: agent = ""
+    return {"now": int(time.time()), "repos": repos, "terminals": terms, **info, "settings": cfg,
+            "roots": roots, "terminalStatus": terminal_status, "duration": round(time.monotonic() - started, 2),
+            "agentCommand": agent if re.fullmatch(r"[a-z0-9_.-]+", agent) else "",
+            "capabilities": {**{c: bool(shutil.which(c)) for c in ("lazygit", "omarchy-launch-editor", "xdg-open", "wl-copy")}, "ombre": (config_path().parent / "plugins/ekkostech.ombre/manifest.json").is_file()}}
+
+
+def detail(path, project):
+    files, known, err = status_files(path)
+    code, out, _ = git(path, "log", "-8", "--format=%h%x00%s%x00%ct")
+    commits = []
+    for line in out.splitlines():
+        parts = line.split("\0")
+        if len(parts) == 3: commits.append({"head": parts[0], "subject": parts[1], "time": parts[2]})
+    handoff = None
+    if shutil.which("ekkos-personal") and project:
+        code, out, _ = command(["ekkos-personal", "handoffs", "--project", project], timeout=5)
+        try:
+            entries = json.loads(out).get("handoffs", [])
+            if not code and entries: handoff = entries[0]
+        except (ValueError, AttributeError): pass
+    return {"path": path, "files": files[:100], "fileCount": len(files), "statusKnown": known, "error": err,
+            "commits": commits, "handoff": handoff}
+
+
+def guard_remove(repo, path, info, terms):
+    records = worktree_records(repo)
+    record = next((w for w in records if w["path"] == path), None)
+    if not record: raise ValueError("Worktree is no longer registered. Refresh first.")
+    w = inspect_worktree(record, repo)
+    if w["main"]: raise ValueError("The main checkout cannot be removed.")
+    if w["locked"]: raise ValueError("This worktree is locked.")
+    if not w["statusKnown"]: raise ValueError("Git status is unavailable; cleanup is blocked.")
+    if w["dirty"]: raise ValueError("This worktree has uncommitted changes. Review them in Git first.")
+    if any(t["cwd"] == path or t["cwd"].startswith(path + "/") for t in terms):
+        raise ValueError("A terminal is still using this worktree.")
+    if info["status"] == "unavailable": raise ValueError("ekkOS claims are unavailable; cleanup is blocked.")
+    if any(c.get("worktree") == path and c.get("state") == "active" and c.get("device") == info["device"] for c in info["claims"]):
+        raise ValueError("An agent owns this worktree. Finish or coordinate its claim first.")
+    if w["ahead"] or not w["published"]: raise ValueError("This commit is not present in a known remote branch. Push and refresh first.")
+    plugins = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home()/".config"))) / "omarchy/plugins"
+    if plugins.is_dir():
+        for plugin in plugins.iterdir():
+            target = os.path.realpath(plugin)
+            if target == path or target.startswith(path + "/"): raise ValueError("An installed plugin uses this worktree.")
+    return w
+
+
+def action(request):
+    kind = request.get("action")
+    if kind in ("pin", "root-add", "root-remove"):
+        raw = str(request.get("path", ""))
+        if not raw.strip(): raise ValueError("Enter a folder path.")
+        cfg = settings(); path = os.path.realpath(os.path.expanduser(raw))
+        key = "pins" if kind == "pin" else "roots"
+        if kind == "root-add" and not os.path.isdir(path): raise ValueError("Choose an existing folder.")
+        if kind == "pin":
+            if path in cfg[key]: cfg[key].remove(path)
+            else: cfg[key].append(path)
+        elif kind == "root-add":
+            if path not in cfg[key]: cfg[key].append(path)
+        elif path in cfg[key]: cfg[key].remove(path)
+        save_settings(cfg)
+        return {"ok": True, "settings": cfg, "message": "Settings saved."}
+    if kind == "remove":
+        repo, path = request["repo"], request["path"]
+        if canonical(repo) != os.path.realpath(repo): raise ValueError("Select the main repository.")
+        terms, status = terminals()
+        if status != "connected": raise ValueError("Terminal inventory unavailable; cleanup is blocked.")
+        guard_remove(repo, path, claims(), terms)
+        code, out, err = git(repo, "worktree", "remove", "--", path)
+        if code: raise ValueError(err or "Git could not remove this worktree.")
+        return {"ok": True, "message": "Clean, published worktree removed."}
+    raise ValueError("Unknown action")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", action="append")
+    parser.add_argument("--max-depth", type=int, default=3, choices=range(0, 9))
+    parser.add_argument("--detail", action="store_true")
+    parser.add_argument("--action", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.detail:
+            req = json.load(sys.stdin); result = detail(req["path"], req.get("project", ""))
+        elif args.action: result = action(json.load(sys.stdin))
+        else: result = scan(args.root, args.max_depth)
+        print(json.dumps(result, separators=(",", ":")))
+    except (ValueError, KeyError, OSError, RuntimeError) as e:
+        print(json.dumps({"ok": False, "error": str(e)})); sys.exit(1)
+
+if __name__ == "__main__": main()

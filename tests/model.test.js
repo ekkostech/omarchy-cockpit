@@ -3,7 +3,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs"); const path = require("node:path"); const vm = require("node:vm");
 const src = fs.readFileSync(path.join(__dirname, "..", "Model.js"), "utf8").replace(/^\.pragma library\s*/, "");
-const M = {}; vm.runInNewContext(src + "\nM.build = build; M.matches = matches; M.ago = ago; M.parseClaims = parseClaims;", { M, JSON, Math, Date });
+const M = {}; vm.runInNewContext(src + "\nM.build = build; M.matches = matches; M.ago = ago; M.parseClaims = parseClaims; M.visible = visible; M.summary = summary; M.cleanupReason = cleanupReason; M.selectedIndex = selectedIndex;", { M, JSON, Math, Date });
 
 const scan = JSON.stringify({ now: 1000000, repos: [
   { path: "/h/p/app", name: "app", remote: "x", worktrees: [
@@ -53,4 +53,20 @@ test("filter matches repo, branch or terminal title; ago formats", () => {
   assert.equal(M.matches(r, "agent/a1"), true);
   assert.equal(M.matches(r, "zzz"), false);
   assert.equal(M.ago(90), "1m"); assert.equal(M.ago(7200), "2h"); assert.equal(M.ago(3 * 86400), "3d");
+});
+
+test("filters combine words, attention includes worktree warnings, and pins sort first",()=>{
+ const b=M.build(scan,claims,"here");
+ assert.equal(M.visible(b.repos,"app fixing","attention",[],"attention").length,1);
+ assert.equal(M.visible(b.repos,"app missing","all",[],"name").length,0);
+ assert.equal(M.visible(b.repos,"","pinned",[],"name").length,0);
+ assert.equal(M.visible(b.repos,"","pinned",["/h/p/app"],"name").length,1);
+ assert.equal(M.summary(b.repos).waiting,1);
+ assert.equal(M.selectedIndex([{path:"b"},{path:"a"}],"a"),1);
+ assert.equal(M.selectedIndex([],"a"),-1);
+ assert.equal(M.cleanupReason(b.repos[0].worktrees[0]),"Main checkout");
+});
+test("Git branch names matching object keys cannot corrupt branch grouping",()=>{
+ const value=JSON.parse(scan);value.repos[0].worktrees.forEach(w=>w.branch="constructor");
+ assert.equal(M.build(JSON.stringify(value),"","").repos.length,1);
 });
