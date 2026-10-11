@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ekkostech.cockpit",
   "name": "Cockpit",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "ekkostech",
   "license": "MIT",
   "description": "Every repo, worktree and agent terminal on your desktop in one keyboard-driven overlay: branches, dirty and unpushed work, who is working where, and warnings when two agents share a branch. Shows ekkOS work claims from other machines when ekkOS Personal is installed.",

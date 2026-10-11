@@ -12,7 +12,7 @@ Item {
   property var shell: null
   property var manifest: null
   readonly property string pluginId: (manifest && manifest.id) || "ekkostech.cockpit"
-  readonly property string version: (manifest && manifest.version) || "0.2.0"
+  readonly property string version: (manifest && manifest.version) || "0.2.1"
   readonly property string pluginDir: decodeURIComponent(String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "")).replace(/\/$/, "")
   property bool opened: false
   property var state: ({
@@ -817,7 +817,7 @@ Item {
                       Label {
                         visible: !!(modelData.claim !== null)
                         width: parent.width
-                        text: modelData.claim ? modelData.claim.agent + " · " + modelData.claim.state + (modelData.claim.stale ? " · stale" : "") : ""
+                        text: modelData.claim ? modelData.claim.agent + " · " + modelData.claim.state + (modelData.claim.stale ? " · stale" : "") + (modelData.claim.paths && modelData.claim.paths.length ? " · " + Model.scope(modelData.claim) : "") : ""
                         color: root.muted
                       }
                     }
@@ -966,7 +966,7 @@ Item {
                         text: "Work claim"
                       }
                       Paragraph {
-                        text: root.worktree && root.worktree.claim ? root.worktree.claim.agent + " · " + root.worktree.claim.state + "\n" + root.worktree.claim.task : ""
+                        text: root.worktree && root.worktree.claim ? root.worktree.claim.agent + " · " + root.worktree.claim.state + "\nCovers: " + Model.scope(root.worktree.claim) + "\n" + root.worktree.claim.task : ""
                       }
                       Heading {
                         visible: !!(root.repo && root.repo.remoteClaims.length > 0)

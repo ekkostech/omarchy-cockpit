@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.2.1 — 2026-10-11
+- ekkOS 1.14 path-scoped claims: claim chips, the worktree details and remote-claim warnings say which paths a claim covers ("whole project" when it names none).
+
 ## 0.2.0 — 2026-10-10
 - Three-pane dashboard with worktree details, visible actions and a version label.
 - Functional text search, attention/active/pinned filters, priority sorting, saved scan folders and stable selection across refreshes.

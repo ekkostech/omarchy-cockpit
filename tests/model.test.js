@@ -3,7 +3,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs"); const path = require("node:path"); const vm = require("node:vm");
 const src = fs.readFileSync(path.join(__dirname, "..", "Model.js"), "utf8").replace(/^\.pragma library\s*/, "");
-const M = {}; vm.runInNewContext(src + "\nM.build = build; M.matches = matches; M.ago = ago; M.parseClaims = parseClaims; M.visible = visible; M.summary = summary; M.cleanupReason = cleanupReason; M.selectedIndex = selectedIndex;", { M, JSON, Math, Date });
+const M = {}; vm.runInNewContext(src + "\nM.build = build; M.matches = matches; M.ago = ago; M.parseClaims = parseClaims; M.visible = visible; M.summary = summary; M.cleanupReason = cleanupReason; M.selectedIndex = selectedIndex; M.scope = scope;", { M, JSON, Math, Date });
 
 const scan = JSON.stringify({ now: 1000000, repos: [
   { path: "/h/p/app", name: "app", remote: "x", worktrees: [
@@ -34,6 +34,15 @@ test("repo-level warnings: duplicate branch and remote claims", () => {
   assert.ok(r.warnings.some((w) => w.includes("claim on mac (claude)")));
   assert.equal(r.remoteClaims.length, 1);
   assert.equal(r.working, true);
+});
+
+test("path-scoped claims say what they cover", () => {
+  const scoped = JSON.stringify({ claims: [
+    { id: "c3", project: "app", agent: "codex", device: "laptop", state: "active", stale: false, branch: "agent/ios", worktree: "/L/.wt/app/ios", task: "t", updated: 7, head: "d", pushed_head: "d", paths: ["ios", "shared/api.ts", 5] } ] });
+  const r = M.build(scan, scoped, "here").repos[0];
+  assert.deepEqual(r.remoteClaims[0].paths, ["ios", "shared/api.ts"]);
+  assert.ok(r.warnings.includes("claim on laptop (codex · ios, shared/api.ts)"));
+  assert.equal(M.scope(M.parseClaims(claims, "here")[0]), "whole project");
 });
 
 test("terminals outside any repo are reported as unplaced", () => {

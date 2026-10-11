@@ -31,7 +31,9 @@ function parseClaims(text, thisDevice) {
         device: String(c.device || ""), local: !!thisDevice && c.device === thisDevice,
         state: String(c.state || ""), stale: c.stale === true, branch: String(c.branch || ""),
         worktree: String(c.worktree || "").replace(/\/+$/, ""), task: String(c.task || ""),
-        updated: Number(c.updated) || 0, pushed: !!c.pushed_head && c.pushed_head === c.head
+        updated: Number(c.updated) || 0, pushed: !!c.pushed_head && c.pushed_head === c.head,
+        // ekkOS 1.14: a claim may cover only some paths; none means the whole project.
+        paths: Array.isArray(c.paths) ? c.paths.filter(function (p) { return typeof p === "string"; }).slice(0, 24) : []
       });
     });
   } catch (e) { }
@@ -39,6 +41,11 @@ function parseClaims(text, thisDevice) {
 }
 
 // One worktree row for the UI, with the terminals inside it and its claim.
+// What a claim covers, in words.
+function scope(claim) {
+  return claim && claim.paths && claim.paths.length ? claim.paths.join(", ") : "whole project";
+}
+
 function buildWorktree(wt, repo, terminals, claims, now) {
   var terms = terminals.filter(function (t) { return inside(t.cwd, wt.path); });
   // The deepest worktree wins: a terminal in a nested worktree is not in the outer one.
@@ -81,7 +88,7 @@ function buildRepo(repo, terminals, claims, now) {
   var remote = claims.filter(function (c) {
     return !c.local && c.state === "active" && (c.project === name || inside(c.worktree, repo.path));
   });
-  remote.forEach(function (c) { warnings.push((c.stale ? "stale " : "") + "claim on " + (c.device.split(":")[0] || "another machine") + " (" + c.agent + ")"); });
+  remote.forEach(function (c) { warnings.push((c.stale ? "stale " : "") + "claim on " + (c.device.split(":")[0] || "another machine") + " (" + c.agent + (c.paths.length ? " · " + scope(c) : "") + ")"); });
   wts.sort(function (a, b) { return (b.main - a.main) || (b.terminals.length - a.terminals.length) || (b.lastCommit || 0) - (a.lastCommit || 0); });
   return Object.assign({}, repo, {
     name: name, worktrees: wts, remoteClaims: remote, warnings: warnings,
